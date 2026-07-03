@@ -5,13 +5,17 @@ event aggregation, and the ``POST /api/jobs/`` submit handler, so a stall in
 that loop hangs job submission while the dashboard head stays healthy on its
 own loop.
 
-``EventLoopMonitor`` watches the loop two ways:
+``EventLoopMonitor`` watches the loop three ways:
 
 * It observes loop lag (via :func:`enable_monitor_loop_lag`) and logs the lag
   and pending-task count when lag is high.
 * A daemon thread watches a heartbeat the loop refreshes and dumps every
   thread's stack via :mod:`faulthandler` when the heartbeat goes stale,
   capturing the frame the loop thread is blocked in.
+* On demand, it dumps every thread's stack when the process receives a signal
+  (``SIGUSR2`` by default), so an operator -- or an external watchdog that
+  detected the hang from outside the process -- can capture the blocked frame
+  immediately, without waiting for the stall threshold.
 
 The stack-dump watchdog runs on its own thread on purpose: a fully blocked loop
 cannot run an asyncio callback or fire an asyncio timeout, so an in-loop monitor
@@ -21,6 +25,8 @@ would be wedged too. It is read-only and never cancels or restarts anything.
 import asyncio
 import faulthandler
 import logging
+import os
+import signal
 import sys
 import threading
 import time
@@ -33,9 +39,9 @@ from ray._private.ray_constants import env_bool, env_float
 logger = logging.getLogger(__name__)
 
 
-# On by default for non-minimal agents; set
-# RAY_DASHBOARD_AGENT_LOOP_MONITOR_ENABLED=0 to disable.
-EVENT_LOOP_MONITOR_ENABLED = env_bool("RAY_DASHBOARD_AGENT_LOOP_MONITOR_ENABLED", True)
+# Diagnostic-only instrumentation; off by default. Opt in with
+# RAY_DASHBOARD_AGENT_LOOP_MONITOR_ENABLED=1.
+EVENT_LOOP_MONITOR_ENABLED = env_bool("RAY_DASHBOARD_AGENT_LOOP_MONITOR_ENABLED", False)
 # How often the loop-lag monitor samples (and the loop refreshes its heartbeat).
 _SAMPLE_INTERVAL_S = env_float("RAY_DASHBOARD_AGENT_LOOP_MONITOR_INTERVAL_S", 0.25)
 # Log a warning when observed loop lag exceeds this.
@@ -46,6 +52,13 @@ _STALL_DUMP_THRESHOLD_S = env_float(
 )
 # Minimum gap between successive dumps so a long stall does not spam the log.
 _DUMP_COOLDOWN_S = env_float("RAY_DASHBOARD_AGENT_LOOP_DUMP_COOLDOWN_S", 60.0)
+# Signal that triggers an immediate all-thread stack dump on demand. Defaults
+# to SIGUSR2, which is unused elsewhere in Ray (Tune already claims SIGUSR1).
+# Set RAY_DASHBOARD_AGENT_LOOP_DUMP_SIGNAL to another signal name, or to an
+# empty value to disable the handler.
+_DUMP_SIGNAL_NAME = os.environ.get(
+    "RAY_DASHBOARD_AGENT_LOOP_DUMP_SIGNAL", "SIGUSR2"
+).strip()
 
 
 class EventLoopMonitor:
@@ -74,6 +87,8 @@ class EventLoopMonitor:
         self._last_dump = 0.0
         self._stop = threading.Event()
         self._watchdog: Optional[threading.Thread] = None
+        # Signal number the on-demand dump handler is registered on, if any.
+        self._dump_signum: Optional[int] = None
 
     def start(self) -> None:
         """Start the monitor. Must be called from within the agent's loop."""
@@ -91,6 +106,7 @@ class EventLoopMonitor:
             daemon=True,
         )
         self._watchdog.start()
+        self._register_dump_signal()
         logger.info(
             "[EventLoopMonitor] watching %s event loop "
             "(lag_warn=%.1fs, stall_dump=%.1fs)",
@@ -145,7 +161,59 @@ class EventLoopMonitor:
         except Exception:
             logger.exception("[EventLoopMonitor] failed to dump thread stacks")
 
+    def _register_dump_signal(self) -> None:
+        """Install an on-demand stack-dump handler on the configured signal.
+
+        Uses :func:`faulthandler.register`, whose C-level handler still fires
+        when the loop thread is hard-blocked holding the GIL -- exactly the
+        case the watchdog exists for -- so an external caller can force a dump
+        at will. ``chain=False`` because ``SIGUSR2``'s default action is to
+        kill the process, which must not happen here.
+
+        Signal handlers can only be registered on the main thread; if the loop
+        runs elsewhere this logs and skips rather than failing start-up.
+        """
+        if not _DUMP_SIGNAL_NAME:
+            return
+        signum = getattr(signal, _DUMP_SIGNAL_NAME, None)
+        if signum is None:
+            # e.g. SIGUSR2 does not exist on Windows.
+            logger.debug(
+                "[EventLoopMonitor] signal %r unavailable; "
+                "on-demand stack dump disabled.",
+                _DUMP_SIGNAL_NAME,
+            )
+            return
+        try:
+            faulthandler.register(
+                signum, file=sys.stderr, all_threads=True, chain=False
+            )
+        except (ValueError, RuntimeError) as e:
+            logger.warning(
+                "[EventLoopMonitor] could not register %s dump handler "
+                "(must run on the main thread): %s",
+                _DUMP_SIGNAL_NAME,
+                e,
+            )
+            return
+        self._dump_signum = signum
+        logger.info(
+            "[EventLoopMonitor] send %s to pid %d to dump all thread stacks.",
+            _DUMP_SIGNAL_NAME,
+            os.getpid(),
+        )
+
+    def _unregister_dump_signal(self) -> None:
+        if self._dump_signum is None:
+            return
+        try:
+            faulthandler.unregister(self._dump_signum)
+        except Exception:
+            logger.exception("[EventLoopMonitor] failed to unregister dump signal")
+        self._dump_signum = None
+
     def stop(self) -> None:
         self._stop.set()
+        self._unregister_dump_signal()
         if self._watchdog is not None and self._watchdog.is_alive():
             self._watchdog.join(timeout=1.0)

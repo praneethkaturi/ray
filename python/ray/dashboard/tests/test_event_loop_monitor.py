@@ -1,5 +1,7 @@
 import asyncio
+import faulthandler
 import logging
+import signal
 import sys
 import threading
 import time
@@ -79,6 +81,37 @@ def test_watchdog_quiet_when_loop_is_healthy(monkeypatch):
     finally:
         monitor.stop()
         monitor._loop.close()
+
+
+def test_dump_signal_registers_and_unregisters(monkeypatch):
+    """start() arms the on-demand dump signal; stop() disarms it."""
+    if not hasattr(signal, "SIGUSR2"):
+        pytest.skip("SIGUSR2 is not available on this platform")
+
+    registered = {}
+    monkeypatch.setattr(
+        faulthandler,
+        "register",
+        lambda signum, **kwargs: registered.update(signum=signum, **kwargs),
+    )
+    monkeypatch.setattr(
+        faulthandler,
+        "unregister",
+        lambda signum: registered.update(unregistered=signum),
+    )
+
+    monitor = EventLoopMonitor()
+    monitor._register_dump_signal()
+    assert registered["signum"] == signal.SIGUSR2
+    assert registered["all_threads"] is True
+    # chain=False so the dump does not fall through to SIGUSR2's default
+    # action, which would terminate the agent.
+    assert registered["chain"] is False
+    assert monitor._dump_signum == signal.SIGUSR2
+
+    monitor._unregister_dump_signal()
+    assert registered["unregistered"] == signal.SIGUSR2
+    assert monitor._dump_signum is None
 
 
 if __name__ == "__main__":
