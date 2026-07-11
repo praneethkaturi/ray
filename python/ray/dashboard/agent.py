@@ -216,13 +216,6 @@ class DashboardAgent:
         if self.server:
             await self.server.start()
 
-        # Watch this agent's event loop for stalls; it also serves job
-        # submission and metric/event export. Minimal agents run neither; set
-        # RAY_DASHBOARD_AGENT_LOOP_MONITOR_ENABLED=0 to disable.
-        if not self.minimal and EVENT_LOOP_MONITOR_ENABLED:
-            self._event_loop_monitor = EventLoopMonitor()
-            self._event_loop_monitor.start()
-
         modules = self._load_modules()
 
         launch_http_server = True
@@ -297,6 +290,16 @@ class DashboardAgent:
                     await asyncio.sleep(3600)
 
             tasks.append(wait_forever())
+
+        # Watch the serving event loop for stalls while the module tasks run;
+        # this loop also handles job submission and metric/event export.
+        # Started here (not during startup) so slow module loading isn't misread
+        # as a stall, and kept adjacent to the try/finally so stop() always
+        # runs. Not started for minimal agents; opt in elsewhere with
+        # RAY_DASHBOARD_AGENT_LOOP_MONITOR_ENABLED=1.
+        if not self.minimal and EVENT_LOOP_MONITOR_ENABLED:
+            self._event_loop_monitor = EventLoopMonitor()
+            self._event_loop_monitor.start()
 
         try:
             await asyncio.gather(*tasks)
