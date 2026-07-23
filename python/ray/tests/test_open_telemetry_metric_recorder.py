@@ -572,10 +572,16 @@ def test_register_does_not_deadlock_with_concurrent_collect(
     )
     register_thread.start()
     # Let the registration reach its lock acquisitions before releasing the
-    # callback, so the pre-fix lock order (recorder._lock held across
-    # meter.create_*) would be interleaved with the in-flight collect().
+    # callback. Under the pre-fix locking (recorder._lock held across
+    # meter.create_*) recorder._lock is what becomes visibly held; under the
+    # fixed locking it is _registration_lock — break on either so the barrier
+    # is fast in both worlds instead of sleeping out the full budget.
     for _ in range(100):
-        if recorder._lock.locked() or not register_thread.is_alive():
+        if (
+            recorder._registration_lock.locked()
+            or recorder._lock.locked()
+            or not register_thread.is_alive()
+        ):
             break
         time.sleep(0.01)
     registration_started.set()
